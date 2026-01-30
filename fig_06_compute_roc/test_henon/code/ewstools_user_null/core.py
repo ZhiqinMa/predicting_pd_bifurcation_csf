@@ -1,0 +1,2359 @@
+#################################################################################################################
+# ewstools
+# Description: Python package for computing, analysing and visualising
+# early warning signals (EWS) in time-series data
+# Author: Thomas M Bury
+# Web: https://www.thomasbury.net/
+# Code repo: https://github.com/ThomasMBury/ewstools
+# Documentation: https://ewstools.readthedocs.io/
+#
+# The MIT License (MIT)
+#
+# Copyright (c) 2019 Thomas Bury
+#
+# Permission is hereby granted, free of charge, to any person obtaining a copy
+# of this software and associated documentation files (the "Software"), to deal
+# in the Software without restriction, including without limitation the rights
+# to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+# copies of the Software, and to permit persons to whom the Software is
+# furnished to do so, subject to the following conditions:
+#
+# The above copyright notice and this permission notice shall be included in all
+# copies or substantial portions of the Software.
+#
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+# AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+# OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+# SOFTWARE.
+#################################################################################################################
+
+
+# ---------------------------------
+# Import relevant packages
+# --------------------------------
+
+# For numeric computation and DataFrames
+import numpy as np
+import pandas as pd
+
+# Module for block-bootstrapping time-series
+from arch.bootstrap import StationaryBootstrap, CircularBlockBootstrap, IIDBootstrap
+
+# For detrending time-series
+from statsmodels.nonparametric.smoothers_lowess import lowess
+from scipy.ndimage import gaussian_filter as gf
+
+# Import functions from other files in package
+import ewstools.helpers as helpers
+
+# Plotly modules for visualisation
+import plotly.express as px
+import plotly.graph_objects as go
+from plotly.subplots import make_subplots
+
+import EntropyHub as EH
+
+# For deprecating old functions
+import deprecation
+
+
+# ---------------
+# Classes
+# --------------
+
+
+class TimeSeries:
+    """
+    Class to hold univariate time series data on which to
+    compute early warning signals.
+
+    Parameters
+    ----------
+    data : list, numpy.ndarray or pandas.Series
+        1D list of data that makes up time series. If given as a pandas.Series,
+        then the index, which should represent time values, is carried over.
+    transition : float
+        Time value at which transition occurs, if any. If defined, early warning signals
+        are only computed up to this point in the time series.
+
+    """
+
+    def __init__(self, data, transition=None):
+        # Put data into a pandas DataFrame
+        if type(data) in [list, np.ndarray]:
+            df_state = pd.DataFrame({"time": np.arange(len(data)), "state": data})
+            df_state.set_index("time", inplace=True)
+
+        # If given as pandas series, carry index forward
+        elif type(data) == pd.Series:
+            df_state = pd.DataFrame({"state": data.values})
+            df_state.index = data.index
+            # Rename index if no name given
+            if not df_state.index.name:
+                df_state.index.name = "time"
+
+        # If data is not provided as either of these, flag error
+        else:
+            print("\nERROR: data has been provided as type {}".format(type(data)))
+            print("Make sure to provide data as either a list, np.ndarray or pd.Series\n")
+            return
+
+        # Set state and transition attributes
+        self.state = df_state
+        self.transition = float(transition) if transition else transition
+
+        # Initialise other attributes
+        self.ews = pd.DataFrame(index=df_state.index)
+        self.dl_preds = pd.DataFrame()
+        self.ktau = dict()
+        self.pspec = None
+        self.pspec_fits = None
+        self.ews_spec = pd.DataFrame()
+
+    def detrend(self, method="Gaussian", bandwidth=0.2, span=0.2):
+        """
+        Detrend the time series using a chosen method.
+        Output is stored in the self.state dataframe.
+
+        Parameters
+        ----------
+        method : str, optional
+            Method of detrending to use.
+            Select from ['Gaussian', 'Lowess']
+            The default is 'Gaussian'.
+        bandwidth : float, optional
+            Bandwidth of Gaussian kernel. Provide as a proportion of data length
+            or as a number of data points. As in the R function ksmooth
+            (used by the earlywarnings package in R), we define the bandwidth
+            such that the kernel has its quartiles at +/- 0.25*bandwidth.
+            The default is 0.2.
+        span : float, optional
+            Span of time-series data used for Lowess filtering. Provide as a
+            proportion of data length or as a number of data points.
+            The default is 0.2.
+
+        Returns
+        -------
+        None.
+
+        """
+
+        # Get time series data prior to transition
+        if self.transition:
+            df_pre = self.state[self.state.index <= self.transition]
+        else:
+            df_pre = self.state
+
+        if method == "Gaussian":
+            # Get size of bandwidth in terms of num. datapoints if given as a proportion
+            if 0 < bandwidth <= 1:
+                bw_num = bandwidth * len(df_pre)
+            else:
+                bw_num = bandwidth
+
+            # Use the gaussian_filter function provided by Scipy
+            # Standard deviation of kernel given bandwidth
+            # Note that for a Gaussian, quartiles are at +/- 0.675*sigma
+            sigma = (0.25 / 0.675) * bw_num
+            smooth_values = gf(df_pre["state"].values, sigma=sigma, mode="reflect")
+            smooth_series = pd.Series(smooth_values, index=df_pre.index)
+
+        if method == "Lowess":
+            # Convert span to a proportion of the length of the data
+            if not 0 < span <= 1:
+                span_prop = span / len(df_pre)
+            else:
+                span_prop = span
+
+            smooth_values = lowess(
+                df_pre["state"].values, df_pre.index.values, frac=span_prop
+            )[:, 1]
+            smooth_series = pd.Series(smooth_values, index=df_pre.index)
+
+        # Add smoothed data and residuals to the 'state' DataFrame
+        self.state["smoothing"] = smooth_series
+        self.state["residuals"] = self.state["state"] - self.state["smoothing"]
+
+    def compute_var(self, rolling_window=0.25):
+        """
+        Compute variance over a rolling window.
+        If residuals have not been computed, computation will be
+        performed over state variable.
+        Output is stored in the self.ews dataframe.
+
+        Parameters
+        ----------
+        rolling_window : float
+            Length of rolling window used to compute variance. Can be specified
+            as an absolute value or as a proportion of the length of the
+            data being analysed. Default is 0.25.
+
+        Returns
+        -------
+        None.
+
+        """
+
+        # Get time series data prior to transition
+        if self.transition:
+            df_pre = self.state[self.state.index <= self.transition]
+        else:
+            df_pre = self.state
+
+        # Get absolute size of rollling window if given as a proportion
+        if 0 < rolling_window <= 1:
+            rw_absolute = int(rolling_window * len(df_pre))
+        else:
+            rw_absolute = rolling_window
+
+        # If residuals column exists, compute over residuals.
+        if "residuals" in df_pre.columns:
+            var_values = df_pre["residuals"].rolling(window=rw_absolute).var()
+        # Else, compute over state variable
+        else:
+            var_values = df_pre["state"].rolling(window=rw_absolute).var()
+
+        self.ews["variance"] = var_values
+
+    def compute_std(self, rolling_window=0.25):
+        """
+        Compute standard deviation over a rolling window.
+        If residuals have not been computed, computation will be
+        performed over state variable.
+        Output is stored in the self.ews dataframe.
+
+
+        Parameters
+        ----------
+        rolling_window : float
+            Length of rolling window used to compute variance. Can be specified
+            as an absolute value or as a proportion of the length of the
+            data being analysed. Default is 0.25.
+
+        Returns
+        -------
+        None.
+
+        """
+
+        # Get time series data prior to transition
+        if self.transition:
+            df_pre = self.state[self.state.index <= self.transition]
+        else:
+            df_pre = self.state
+
+        # Get absolute size of rollling window if given as a proportion
+        if 0 < rolling_window <= 1:
+            rw_absolute = int(rolling_window * len(df_pre))
+        else:
+            rw_absolute = rolling_window
+
+        # If residuals column exists, compute over residuals.
+        if "residuals" in df_pre.columns:
+            std_values = df_pre["residuals"].rolling(window=rw_absolute).std()
+        # Else, compute over state variable
+        else:
+            std_values = df_pre["state"].rolling(window=rw_absolute).std()
+
+        self.ews["std"] = std_values
+
+    def compute_cv(self, rolling_window=0.25):
+        """
+        Compute coefficient of variation over a rolling window.
+        This is the standard deviation of the residuals divided by the
+        mean of the state variable.
+        If residuals have not been computed, computation will be
+        performed over state variable.
+        Output is stored in the self.ews dataframe.
+
+        Parameters
+        ----------
+        rolling_window : float
+            Length of rolling window used to compute variance. Can be specified
+            as an absolute value or as a proportion of the length of the
+            data being analysed. Default is 0.25.
+
+        Returns
+        -------
+        None.
+
+        """
+
+        # Get time series data prior to transition
+        if self.transition:
+            df_pre = self.state[self.state.index <= self.transition]
+        else:
+            df_pre = self.state
+
+        # Get absolute size of rollling window if given as a proportion
+        if 0 < rolling_window <= 1:
+            rw_absolute = int(rolling_window * len(df_pre))
+        else:
+            rw_absolute = rolling_window
+
+        # Get standard deviation values
+        # If residuals column exists, compute over residuals.
+        if "residuals" in df_pre.columns:
+            std_values = df_pre["residuals"].rolling(window=rw_absolute).std()
+        # Else, compute over state variable
+        else:
+            std_values = df_pre["state"].rolling(window=rw_absolute).std()
+
+        # Get mean values from state variable
+        mean_values = df_pre["state"].rolling(window=rw_absolute).mean()
+
+        cv_values = std_values / mean_values
+
+        self.ews["cv"] = cv_values
+
+    def compute_auto(self, rolling_window=0.25, lag=1):
+        """
+        Compute autocorrelation at a give lag over a rolling window.
+        If residuals have not been computed, computation will be
+        performed over state variable.
+        Output is stored in the self.ews dataframe.
+
+        Parameters
+        ----------
+        rolling_window : float
+            Length of rolling window used to compute autocorrelation. Can be specified
+            as an absolute value or as a proportion of the length of the
+            data being analysed. Default is 0.25.
+        lag : int
+            Lag of autocorrelation
+
+        Returns
+        -------
+        None.
+
+        """
+
+        # Get time series data prior to transition
+        if self.transition:
+            df_pre = self.state[self.state.index <= self.transition]
+        else:
+            df_pre = self.state
+
+        # Get absolute size of rollling window if given as a proportion
+        if 0 < rolling_window <= 1:
+            rw_absolute = int(rolling_window * len(df_pre))
+        else:
+            rw_absolute = rolling_window
+
+        # If residuals column exists, compute over residuals.
+        if "residuals" in df_pre.columns:
+            ac_values = (
+                df_pre["residuals"]
+                    .rolling(window=rw_absolute)
+                    .apply(func=lambda x: pd.Series(x).autocorr(lag=lag), raw=True)
+            )
+        # Else, compute over state variable
+        else:
+            ac_values = (
+                df_pre["state"]
+                    .rolling(window=rw_absolute)
+                    .apply(func=lambda x: pd.Series(x).autocorr(lag=lag), raw=True)
+            )
+
+        self.ews["ac{}".format(lag)] = ac_values
+
+    def compute_skew(self, rolling_window=0.25):
+        """
+        Compute skew over a rolling window.
+        If residuals have not been computed, computation will be
+        performed over state variable.
+        Output is stored in the self.ews dataframe.
+
+
+        Parameters
+        ----------
+        rolling_window : float
+            Length of rolling window used to compute variance. Can be specified
+            as an absolute value or as a proportion of the length of the
+            data being analysed. Default is 0.25.
+
+        Returns
+        -------
+        None.
+
+        """
+
+        # Get time series data prior to transition
+        if self.transition:
+            df_pre = self.state[self.state.index <= self.transition]
+        else:
+            df_pre = self.state
+
+        # Get absolute size of rollling window if given as a proportion
+        if 0 < rolling_window <= 1:
+            rw_absolute = int(rolling_window * len(df_pre))
+        else:
+            rw_absolute = rolling_window
+
+        # If residuals column exists, compute over residuals.
+        if "residuals" in df_pre.columns:
+            skew_values = df_pre["residuals"].rolling(window=rw_absolute).skew()
+        # Else, compute over state variable
+        else:
+            skew_values = df_pre["state"].rolling(window=rw_absolute).skew()
+
+        self.ews["skew"] = skew_values
+
+    def compute_kurt(self, rolling_window=0.25):
+        """
+        Compute kurtosis over a rolling window.
+        If residuals have not been computed, computation will be
+        performed over state variable.
+        Output is stored in the self.ews dataframe.
+
+
+        Parameters
+        ----------
+        rolling_window : float
+            Length of rolling window used to compute variance. Can be specified
+            as an absolute value or as a proportion of the length of the
+            data being analysed. Default is 0.25.
+
+        Returns
+        -------
+        None.
+
+        """
+
+        # Get time series data prior to transition
+        if self.transition:
+            df_pre = self.state[self.state.index <= self.transition]
+        else:
+            df_pre = self.state
+
+        # Get absolute size of rollling window if given as a proportion
+        if 0 < rolling_window <= 1:
+            rw_absolute = int(rolling_window * len(df_pre))
+        else:
+            rw_absolute = rolling_window
+
+        # If residuals column exists, compute over residuals.
+        if "residuals" in df_pre.columns:
+            kurt_values = df_pre["residuals"].rolling(window=rw_absolute).kurt()
+        # Else, compute over state variable
+        else:
+            kurt_values = df_pre["state"].rolling(window=rw_absolute).kurt()
+
+        self.ews["kurtosis"] = kurt_values
+
+    def compute_entropy(self, rolling_window=0.25, method="sample", **kwargs):
+        """
+        Compute entropy using a given method over a rolling window.
+        Uses EntropyHub https://www.entropyhub.xyz/Home.html.
+        If residuals have not been computed, computation will be
+        performed over state variable.
+        Output is stored in the self.ews dataframe.
+
+        Parameters
+        ----------
+        rolling_window : float
+            Length of rolling window used to compute variance. Can be specified
+            as an absolute value or as a proportion of the length of the
+            data being analysed. Default is 0.25.
+        method : str
+            The method by which to compute entropy. Options include 'sample',
+            'approximate', and 'kolmogorov'
+        **kwargs
+            Keyword arguments for the EntropyHub function
+
+        Returns
+        -------
+        None.
+
+        """
+
+        # Get time series data prior to transition
+        if self.transition:
+            df_pre = self.state[self.state.index <= self.transition]
+        else:
+            df_pre = self.state
+
+        # Get absolute size of rollling window if given as a proportion
+        if 0 < rolling_window <= 1:
+            rw_absolute = int(rolling_window * len(df_pre))
+        else:
+            rw_absolute = rolling_window
+
+        # Get data on which to compute entropy
+        if "residuals" in df_pre.columns:
+            ts_vals = df_pre["residuals"]
+        else:
+            ts_vals = df_pre["state"]
+
+        # Compute sample entropy
+        if method == "sample":
+            def entropy_func(series):
+                Samp, A, B = EH.SampEn(series.values, **kwargs)
+                return Samp
+
+        # Compute approxiamte entropy
+        if method == "approximate":
+            def entropy_func(series):
+                Ap, Phi = EH.ApEn(series.values, **kwargs)
+                return Ap
+
+        # Compute komogorov entropy
+        if method == "kolmogorov":
+            def entropy_func(series):
+                K2, Ci = EH.K2En(series.values, **kwargs)
+                return K2
+
+        list_times = []
+        list_entropy = []
+        # Set up rolling window (cannot use pandas.rolling as multi-output fn)
+        for k in np.arange(0, len(ts_vals) - (rw_absolute - 1)):
+            # Select subset of series contained in window
+            window_series = ts_vals.iloc[k: k + rw_absolute]
+            # Assign the time value for the metrics (right end point of window)
+            t_point = ts_vals.index[k + (rw_absolute - 1)]
+            # Compute entropy (value for each channel)
+            entropy = entropy_func(window_series)
+
+            list_times.append(t_point)
+            list_entropy.append(entropy)
+
+        ar_entropy = np.array(list_entropy)
+
+        df_entropy = pd.DataFrame()
+        df_entropy["time"] = list_times
+        num_embedding_dims = ar_entropy.shape[1]
+        for dim in range(num_embedding_dims):
+            df_entropy["{}-entropy-{}".format(method, dim)] = ar_entropy[:, dim]
+        df_entropy.set_index("time", inplace=True)
+
+        # Add info to self.ews dataframe
+        for col in df_entropy.columns:
+            self.ews[col] = df_entropy[col]
+        # self.ews = pd.merge(self.ews, df_entropy, how="left", on="time")
+
+    def compute_ktau(self, tmin="earliest", tmax="latest"):
+        """
+        Compute kendall tau values of CSD-based EWS.
+        Output is placed in the attribute *ktau*, which is a Python
+        dictionary contianing Kendall tau values for each CSD-based EWS.
+
+        Parameters
+        ----------
+        tmin : float or 'earliest'
+            Start time for kendall tau computation. If 'earliest', then
+            time is taken as earliest time point in EWS time series.
+        tmax : float or 'latest'
+            End time for kendall tau computation. If 'latest', then time is
+            taken as latest time point in EWS time series, which could be
+            the end of the state time series, or a defined transtion point.
+
+        """
+
+        # Get tmin and tmax values if using extrema
+        if tmin == "earliest":
+            tmin = self.ews.dropna(how="all").index[0]
+
+        if tmax == "latest":
+            tmax = self.ews.dropna(how="all").index[-1]
+
+        # Get cropped data
+        df_ews = self.ews[(self.ews.index >= tmin) & (self.ews.index <= tmax)].copy()
+
+        # Include smax in Kendall tau computation if it exists
+        if "smax" in self.ews_spec.columns:
+            df_ews = df_ews.join(self.ews_spec["smax"])
+
+        # Make a series with the time values
+        time_values = pd.Series(data=df_ews.index, index=df_ews.index)
+        ktau_out = df_ews.corrwith(time_values, method="kendall", axis=0)
+        self.ktau = dict(ktau_out)
+
+    def apply_classifier(self, classifier, tmin, tmax, name="c1", verbose=1):
+        """
+        Apply a deep learning classifier to the residual time series from
+        tmin to tmax.
+        If time series has not been detrended, apply to the raw data.
+        Predictions from the classifier are saved into the attribute dl_preds.
+
+        Parameters
+        ----------
+        classifier : keras.engine.sequential.Sequential
+            Tensorflow classifier
+        tmin : float
+            Earliest time in time series segment (inclusive)
+        tmax : float
+            Latest time in time series segment (not inclusive)
+        name : str, optional
+            Name assigned to the classifier. The default is 'c1'.
+        verbose : int, optional
+            Verbosity of update messages from TensorFlow. 0 = silent, 1 = progress bar, 2 = single line.
+            The default is 1.
+
+        Returns
+        -------
+        None.
+
+        """
+
+        # Length of time series required as input to classifier
+        input_len = classifier.layers[0].input_shape[1]
+
+        # Get time series segment. Use residuals if detrending performed.
+        # Otherwise use state variable.
+        if "residuals" in self.state.columns:
+            series = self.state[(self.state.index >= tmin) & (self.state.index < tmax)][
+                "residuals"
+            ]
+        else:
+            series = self.state[(self.state.index >= tmin) & (self.state.index < tmax)][
+                "state"
+            ]
+
+        # Get values in series
+        data = series.values
+
+        # If time series segment is larger than input dimension of classifier
+        if len(data) > input_len:
+            print(
+                "ERROR: Length of time series segment is too long for the classifier. You can modify the tmin and tmax parameters to select a smaller segment."
+            )
+            return
+
+        # Normalise by mean of absolute value
+        data_norm = data / (abs(data).mean())
+
+        # Prepend with zeros to make appropriate length for classifier
+        num_zeros = input_len - len(data_norm)
+        input_data = np.concatenate((np.zeros(num_zeros), data_norm)).reshape(1, -1, 1)
+
+        # Get DL prediction
+        dl_pred = classifier.predict(input_data, verbose=verbose)[0]
+        # Put info into dataframe
+        dict_dl_pred = {i: val for (i, val) in zip(np.arange(len(dl_pred)), dl_pred)}
+        dict_dl_pred["time"] = series.index[-1]
+        dict_dl_pred["classifier"] = name
+        df_dl_pred = pd.DataFrame(dict_dl_pred, index=[len(self.dl_preds)])
+
+        # Append to dataframe contiaining DL predictions
+        self.dl_preds = pd.concat([self.dl_preds, df_dl_pred], ignore_index=True)
+
+    def apply_classifier_inc(self, classifier, inc=10, name="c1", verbose=1):
+        """
+        Apply a deep learning classifier to incrementally increasing time
+        series lengths. First prediction is made on time series segment from
+        data point at index 0 to data point at index inc. Second prediction
+        is made on time series segment from 0 to 2*inc. Third prediction is
+        made on time series segment from 0 to 3*inc. Etc.
+
+        Parameters
+        ----------
+        classifier : keras.engine.sequential.Sequential
+            TensorFlow classifier.
+        inc : int, optional
+            Increment to tmax (the end time of each time series segment) after each classification.
+            The default is 10.
+        name : str, optional
+            Name assigned to the classifier. The default is 'c1'.
+        verbose : int, optional
+            Verbosity of update messages from TensorFlow.
+            0 = silent, 1 = progress bar, 2 = single line.
+            The default is 1.
+
+        Returns
+        -------
+        None.
+
+        """
+
+        dt = self.state.index[1] - self.state.index[0]
+        tmin = self.state.index[0]
+        tend = self.state.index[-1] if not self.transition else self.transition
+        tend += dt  # Make transition point inclusive
+
+        # Tmax values for each time series segment
+        tmax_vals = np.arange(tmin + inc, tend + dt, inc)
+        for tmax in tmax_vals:
+            self.apply_classifier(
+                classifier, name=name, tmin=tmin, tmax=tmax, verbose=verbose
+            )
+
+    def clear_dl_preds(self):
+        """
+        Clear the attribute *dl_preds*
+
+        Returns
+        -------
+        None.
+        """
+
+        self.dl_preds = pd.DataFrame()
+
+    def compute_spectrum(
+            self,
+            rolling_window=0.25,
+            ham_length=40,
+            ham_offset=0.5,
+            pspec_roll_offset=20,
+            w_cutoff=1,
+    ):
+        """
+        Compute the power spectrum over a rolling window.
+        Stores the power spectra as a DataFrame in TimeSeries.pspec
+
+        Parameters
+        ----------
+        rolling_window : float
+            Length of rolling window used to compute variance. Can be specified
+            as an absolute value or as a proportion of the length of the
+            data being analysed. Default is 0.25.
+        ham_length : int
+            Length of the Hamming window used to compute the power spectrum.
+            The default is 40.
+        ham_offset : float
+            Hamming offset as a proportion of the Hamming window size.
+            The default is 0.5.
+        pspec_roll_offset : int
+            Rolling window offset used when computing power spectra. Power spectrum
+            computation is relatively expensive so this is rarely taken as 1
+            (as is the case for the other EWS). The default is 20.
+        w_cutoff : floag
+            Cutoff frequency used in power spectrum. Given as a proportion of the
+            maximum permissable frequency in the empirical power spectrum.
+
+        Returns
+        -------
+        None.
+
+        """
+
+        # Get time series data prior to transition
+        if self.transition:
+            df_pre = self.state[self.state.index <= self.transition]
+        else:
+            df_pre = self.state
+
+        # Get absolute size of rollling window if given as a proportion
+        if 0 < rolling_window <= 1:
+            rw_absolute = int(rolling_window * len(df_pre))
+        else:
+            rw_absolute = rolling_window
+
+        # If residuals column exists, compute over residuals.
+        if "residuals" in df_pre.columns:
+            series = df_pre["residuals"]
+        # Else, compute over state variable
+        else:
+            series = df_pre["state"]
+
+        # Number of components in the residual time-series
+        num_comps = len(df_pre)
+
+        # Rolling window offset (can make larger to save on computation time)
+        roll_offset = int(pspec_roll_offset)
+        # Time separation between data points (need for frequency values of power spectrum)
+        dt = series.index[1] - series.index[0]
+
+        # Initialise a list to store the power spectra
+        list_pspec = []
+
+        # Loop through window locations shifted by roll_offset
+        for k in np.arange(0, num_comps - (rw_absolute - 1), roll_offset):
+            # Select subset of series contained in window
+            window_series = series.iloc[k: k + rw_absolute]
+            # Asisgn the time value for the metrics (right end point of window)
+            t_point = series.index[k + (rw_absolute - 1)]
+
+            ## Compute the power spectrum using function pspec_welch
+            pspec = helpers.pspec_welch(
+                window_series,
+                dt,
+                ham_length=ham_length,
+                ham_offset=ham_offset,
+                w_cutoff=w_cutoff,
+                scaling="spectrum",
+            )
+
+            ## Create DataFrame for empirical power spectrum
+            df_pspec_empirical = pspec.to_frame().reset_index()
+            # Rename column
+            df_pspec_empirical.rename(
+                columns={"Power spectrum": "empirical"}, inplace=True
+            )
+            # Include a column for the time-stamp
+            df_pspec_empirical["time"] = t_point * np.ones(len(pspec))
+            list_pspec.append(df_pspec_empirical)
+
+        # Concatenate power spectra dataframes and store in attribute pspec
+        self.pspec = pd.concat(list_pspec)
+
+    def compute_smax(self):
+        """
+        Compute Smax (the maximum power in the power spectrum).
+        This can only be applied after applying compute_spectrum().
+        Stores Smax values in TimeSeries.ews_spec
+
+        Returns
+        -------
+        None.
+
+        """
+
+        if self.pspec is None:
+            print(
+                "ERROR: The power spectrum must be computed before computing\
+                  spectral EWS such as Smax. The power spectrum can be\
+                  computed using compute_pspec()"
+            )
+
+        smax_values = self.pspec[["time", "power"]].groupby(["time"]).max()
+        self.ews_spec["smax"] = smax_values
+
+    def compute_spec_type(self, sweep=False):
+        """
+        Fit the analytical forms of the Fold, Hopf and Null power spectrum
+        to the empirical power spectrum. Get Akaike Information Criterion
+        (AIC) weights to determine best fit.
+        Store AIC weights in TimeSeries.ews_spec
+        Store fitted power spectra in TimeSeries.pspec_fits
+
+        Parameters
+        ----------
+        sweep : bool
+            If 'True', sweep over a range of intialisation
+            parameters when optimising to compute AIC scores, at the expense of
+            longer computation. If 'False', intialisation parameter is taken as the
+            'best guess'. The default is False.
+
+        Returns
+        -------
+        None.
+
+        """
+
+        if self.pspec is None:
+            print(
+                "ERROR: The power spectrum must be computed before computing\
+                  the spectrum type. The power spectrum can be\
+                  computed using compute_pspec()"
+            )
+
+        list_aic = []
+        list_pspec_fits = []
+
+        # Loop through time values
+        for time in self.pspec["time"].unique():
+            pspec = self.pspec[self.pspec["time"] == time]
+            pspec_series = pspec.set_index("frequency")["power"]
+
+            ## Compute the AIC values
+            metrics = helpers.pspec_metrics(pspec_series, ews=["aic"], sweep=sweep)
+            dict_aic = {}
+            dict_aic["fold"] = metrics["AIC fold"]
+            dict_aic["hopf"] = metrics["AIC hopf"]
+            dict_aic["null"] = metrics["AIC null"]
+            dict_aic["time"] = time
+            list_aic.append(dict_aic)
+
+            # Generate data to plot the fitted power spectra
+
+            # Create fine-scale frequency values
+            wVals = np.linspace(min(pspec.index), max(pspec.index), 100)
+            # Fold fit
+            pspec_fold = helpers.psd_fold(
+                wVals,
+                metrics["Params fold"]["sigma"],
+                metrics["Params fold"]["lam"],
+            )
+            # Hopf fit
+            pspec_hopf = helpers.psd_hopf(
+                wVals,
+                metrics["Params hopf"]["sigma"],
+                metrics["Params hopf"]["mu"],
+                metrics["Params hopf"]["w0"],
+            )
+            # Null fit
+            pspec_null = helpers.psd_null(wVals, metrics["Params null"]["sigma"])
+
+            ## Put spectrum fits into a dataframe
+            dict_fits = {
+                "time": time * np.ones(len(wVals)),
+                "frequency": wVals,
+                "fit fold": pspec_fold,
+                "fit hopf": pspec_hopf,
+                "fit null": pspec_null,
+            }
+            df_pspec_fits = pd.DataFrame(dict_fits)
+            list_pspec_fits.append(df_pspec_fits)
+
+        # Concatenate
+        df_aic = pd.DataFrame(list_aic).set_index("time")
+        df_pspec_fits = pd.concat(list_pspec_fits)
+
+        self.ews_spec = self.ews_spec.join(df_aic)
+        self.pspec_fits = df_pspec_fits
+
+    def make_plotly(self, kendall_tau=True, ens_avg=False):
+        """
+        Make an interactive Plotly figure to view all EWS computed
+
+        Parameters
+        ----------
+
+        kendall_tau : bool, optional
+            Set as true to show Kendall tau values (if they have been computed)
+            Default is True.
+        ens_avg : bool, optional
+            Plot the ensenble average of DL predictions.
+            Default is False.
+
+        Returns
+        -------
+        Plotly figure
+
+        """
+
+        # Trace colours
+        colours = px.colors.qualitative.Plotly
+        # Count number of panels for Plotly subplots
+        row_count = 0
+        # Always a row for state varialbe
+        row_count += 1
+        # Row for autocorrelation
+        ac_labels = [s for s in self.ews.columns if s[:2] == "ac"]
+        if len(ac_labels) > 0:
+            row_count += 1
+        # Row for each other EWS
+        row_count += len(self.ews.columns) - len(ac_labels)
+        # Row for Smax if included
+        if "smax" in self.ews_spec.columns:
+            row_count += 1
+        # Row for AIC weights if computed
+        if "fold" in self.ews_spec.columns:
+            row_count += 1
+        # Row for DL predictions if computed
+        if len(self.dl_preds.columns) > 0:
+            row_count += 1
+
+        num_rows = row_count
+        row_count = 1  # reset row counter
+
+        # Make Plotly subplots frame
+        fig = make_subplots(
+            rows=num_rows,
+            cols=1,
+            shared_xaxes=True,
+            x_title="Time",
+            vertical_spacing=0.02,
+        )
+
+        # Plot state variable
+        fig.add_trace(
+            go.Scatter(
+                x=self.state.index.values,
+                y=self.state["state"].values,
+                name="state",
+            ),
+            row=row_count,
+            col=1,
+        )
+        fig.update_yaxes(title="State", row=row_count)
+
+        # Plot smoothing if computed
+        if "smoothing" in self.state.columns:
+            fig.add_trace(
+                go.Scatter(
+                    x=self.state.index.values,
+                    y=self.state["smoothing"].values,
+                    name="smoothing",
+                ),
+                row=row_count,
+                col=1,
+            )
+
+        # Plot variance if computed
+        if "variance" in self.ews.columns:
+            row_count += 1
+
+            # Add kendall tau to name
+            if kendall_tau and ("variance" in self.ktau.keys()):
+                ktau = self.ktau["variance"]
+                name = "variance (ktau={:.2f})".format(ktau)
+            else:
+                name = "variance"
+
+            fig.add_trace(
+                go.Scatter(
+                    x=self.ews.index.values,
+                    y=self.ews["variance"].values,
+                    name=name,
+                ),
+                row=row_count,
+                col=1,
+            )
+            fig.update_yaxes(title="Variance", row=row_count)
+
+        # Plot standard deviation if computed
+        if "std" in self.ews.columns:
+            row_count += 1
+
+            # Add kendall tau to name
+            if kendall_tau and ("std" in self.ktau.keys()):
+                ktau = self.ktau["std"]
+                name = "std (ktau={:.2f})".format(ktau)
+            else:
+                name = "std"
+
+            fig.add_trace(
+                go.Scatter(
+                    x=self.ews.index.values,
+                    y=self.ews["std"].values,
+                    name=name,
+                ),
+                row=row_count,
+                col=1,
+            )
+            fig.update_yaxes(title="St. Dev.", row=row_count)
+
+        # Plot coefficient of variation if computed
+        if "cv" in self.ews.columns:
+            row_count += 1
+
+            # Add kendall tau to name
+            if kendall_tau and ("cv" in self.ktau.keys()):
+                ktau = self.ktau["cv"]
+                name = "cv (ktau={:.2f})".format(ktau)
+            else:
+                name = "cv"
+
+            fig.add_trace(
+                go.Scatter(
+                    x=self.ews.index.values,
+                    y=self.ews["cv"].values,
+                    name=name,
+                ),
+                row=row_count,
+                col=1,
+            )
+            fig.update_yaxes(title="Coeff. of Var.", row=row_count)
+
+        # Plot autocorrelation metrics if computed
+        if len(ac_labels) != 0:
+            row_count += 1
+        for ac_label in ac_labels:
+            # Add kendall tau to name
+            if kendall_tau and (ac_label in self.ktau.keys()):
+                ktau = self.ktau[ac_label]
+                name = "{} (ktau={:.2f})".format(ac_label, ktau)
+            else:
+                name = ac_label
+
+            fig.add_trace(
+                go.Scatter(
+                    x=self.ews.index.values,
+                    y=self.ews[ac_label].values,
+                    name=name,
+                ),
+                row=row_count,
+                col=1,
+            )
+            fig.update_yaxes(title="Autocorrelation", row=row_count)
+
+        # Plot skew if computed
+        if "skew" in self.ews.columns:
+            row_count += 1
+
+            # Add kendall tau to name
+            if kendall_tau and ("skew" in self.ktau.keys()):
+                ktau = self.ktau["skew"]
+                name = "skew (ktau={:.2f})".format(ktau)
+            else:
+                name = "skew"
+
+            fig.add_trace(
+                go.Scatter(
+                    x=self.ews.index.values,
+                    y=self.ews["skew"].values,
+                    name=name,
+                ),
+                row=row_count,
+                col=1,
+            )
+            fig.update_yaxes(title="Skew", row=row_count)
+
+        # Plot kurtosis if computed
+        if "kurtosis" in self.ews.columns:
+            row_count += 1
+
+            # Add kendall tau to name
+            if kendall_tau and ("kurtosis" in self.ktau.keys()):
+                ktau = self.ktau["kurtosis"]
+                name = "kurtosis (ktau={:.2f})".format(ktau)
+            else:
+                name = "kurtosis"
+
+            fig.add_trace(
+                go.Scatter(
+                    x=self.ews.index.values,
+                    y=self.ews["kurtosis"].values,
+                    name=name,
+                ),
+                row=row_count,
+                col=1,
+            )
+            fig.update_yaxes(title="Kurtosis", row=row_count)
+
+        # Plot Smax if computd
+        if "smax" in self.ews_spec.columns:
+            row_count += 1
+
+            # Add kendall tau to name
+            if kendall_tau and ("smax" in self.ktau.keys()):
+                ktau = self.ktau["smax"]
+                name = "smax (ktau={:.2f})".format(ktau)
+            else:
+                name = "smax"
+
+            fig.add_trace(
+                go.Scatter(
+                    x=self.ews_spec.index.values,
+                    y=self.ews_spec["smax"].values,
+                    name=name,
+                ),
+                row=row_count,
+                col=1,
+            )
+            fig.update_yaxes(title="Smax", row=row_count)
+
+        # Plot AIC weights if computd
+        if "fold" in self.ews_spec.columns:
+            row_count += 1
+            aic_labels = ["fold", "hopf", "null"]
+            for aic_label in aic_labels:
+                fig.add_trace(
+                    go.Scatter(
+                        x=self.ews_spec.index.values,
+                        y=self.ews_spec[aic_label].values,
+                        name=aic_label,
+                    ),
+                    row=row_count,
+                    col=1,
+                )
+
+            fig.update_yaxes(title="AIC weights", row=row_count)
+
+        # Plot DL predictions if computed
+        if len(self.dl_preds) > 0:
+            row_count += 1
+            class_labels = [
+                s for s in self.dl_preds.columns if s not in ["time", "classifier"]
+            ]
+            classifiers = self.dl_preds["classifier"].unique()
+
+            # If plotting predictions from every classifier
+            if not ens_avg:
+                # Loop through class labels and classifier names
+                for idx, class_label in enumerate(class_labels):
+                    for idx2, classifier in enumerate(classifiers):
+                        df_plot = self.dl_preds[
+                            self.dl_preds["classifier"] == classifier
+                            ]
+                        fig.add_trace(
+                            go.Scatter(
+                                x=df_plot["time"].values,
+                                y=df_plot[class_label].values,
+                                name="DL class {}".format(class_label),
+                                legendgroup="DL class {}".format(class_label),
+                                showlegend=True if idx2 == 0 else False,
+                                line=dict(color=colours[idx]),
+                            ),
+                            row=row_count,
+                            col=1,
+                        )
+
+            # If plotting ensemble average over classifiers
+            else:
+                df = self.dl_preds.drop(["classifier"], axis=1)  # JJV
+                df_plot = df.groupby(["time"]).mean().reset_index()  # JJV
+
+                # Loop through class labels
+                for idx, class_label in enumerate(class_labels):
+                    fig.add_trace(
+                        go.Scatter(
+                            x=df_plot["time"].values,
+                            y=df_plot[class_label].values,
+                            name="DL class {}".format(class_label),
+                            line=dict(color=colours[idx]),
+                        ),
+                        row=row_count,
+                        col=1,
+                    )
+
+            fig.update_yaxes(title="DL predictions", row=row_count)
+
+        # Set figure dimensions
+        fig.update_layout(height=200 * num_rows, width=800)
+
+        # Separation between legend entries
+        fig.layout.legend.tracegroupgap = 0
+
+        return fig
+
+    # ------------------------------------------ User function ------------------------------------------
+    # # Calculate 'dominant_eigenvalue (de)' method 1：
+    # def fit_data_with_curve_fit(self, xdata, ydata, user_model):
+    #     from scipy.optimize import curve_fit
+    #     try:
+    #         # 使用curve_fit函数拟合数据
+    #         # popt, pcov = curve_fit(damped_sine, xdata, ydata)
+    #         popt, pcov = curve_fit(user_model, xdata, ydata, maxfev=10000000)
+    #         # 计算参数的标准偏差
+    #         if pcov is not None:
+    #             perr = np.sqrt(np.diag(pcov))
+    #         else:
+    #             perr = np.array([np.inf] * len(popt))  # 如果 pcov 是无效的，则标准偏差为无限
+    #     except ValueError as e:
+    #         print(e)
+    #
+    #     # Calculate the quality of fit=计算拟合质量R^2
+    #     y_pred = user_model(xdata, *popt)
+    #
+    #     # calculate R^2
+    #     ss_res = np.sum((ydata - y_pred) ** 2)
+    #     ss_tot = np.sum((ydata - np.mean(ydata)) ** 2)
+    #     r_squared = 1 - (ss_res / ss_tot)
+    #     # print('R^2: ', r_squared)
+    #     # print("--------------------")
+    #
+    #     # Extract specific values from parameter data = 从参数数据中提取特定值
+    #     dominant_eigenvalue = popt[0]
+    #     dominant_eigenvalue_stderr = perr[0]
+    #     # print('dominant_eigenvalue: ', dominant_eigenvalue)
+    #     # print('dominant_eigenvalue_stderr: ', dominant_eigenvalue_stderr)
+    #     # print('\n')
+    #
+    #     return dominant_eigenvalue, r_squared
+    #
+    # def fit_data_with_lmfit(self, xdata, ydata, user_model):
+    #     from lmfit import Model
+    #     from lmfit import Minimizer, Parameters, create_params, report_fit
+    #     try:
+    #         # method 1:
+    #         mod = Model(user_model)
+    #         result = mod.fit(ydata, x=xdata, R=1.0, A=1.0, phi=1.0, omega=1.0, max_nfev=10000000)
+    #
+    #         # # or method 2:
+    #         # mod = Model(user_model)
+    #         # params = create_params(R=0.0, min=-1.0, max=1.0
+    #         #                        A=dict(value=1.0),
+    #         #                        offset=0.1)
+    #         # result = mod.fit(y, params, x=x)
+    #
+    #     except ValueError as e:
+    #         print(e)
+    #
+    #     # # write error report
+    #     # report_fit(result)
+    #
+    #     # Method 1: Use the index to get the first value = 使用索引获取第一个值
+    #     r_squared = result.rsquared
+    #     dominant_eigenvalue = result.params['R'].value
+    #     dominant_eigenvalue_stderr = result.params['R'].stderr
+    #     # print('r_squared=', r_squared)
+    #     # print('dominant_eigenvalue=', dominant_eigenvalue)
+    #     # print('dominant_eigenvalue_stderr=', dominant_eigenvalue_stderr)
+    #
+    #     # # Method 2: Save as a DataFrame = 保存为 DataFrame
+    #     # data = []
+    #     # for name, param in result.params.items():
+    #     #     # print(f'{name:7s} {param.value:11.5f} {param.stderr:11.5f}')
+    #     #     data.append([name, param.value, param.stderr])
+    #     #
+    #     # # Save a DataFrame
+    #     # df_result = pd.DataFrame(data, columns=['parameter_name', 'parameter_value', 'parameter_stderr'])
+    #     # # print(df_result)
+    #     # # dominant_eigenvalue = df_result.loc[0, 'parameter_value']
+    #     # # print(dominant_eigenvalue)
+    #
+    #     return dominant_eigenvalue, r_squared
+    #
+    #
+    # def compute_de(self, rolling_window=0.25, lags=None, fit_method='lmfit', roll_offset=20, user_model='test_model'):
+    #     '''
+    #     Compute dominant eigenvalue extracted from autocorrelation (DE-AC) over a rolling window.
+    #     Add to dataframe.
+    #
+    #     Parameters
+    #     ----------
+    #     rolling_window: float
+    #         Length of rolling window used to compute autocorrelation. Can be specified
+    #         as an absolute value or as a proportion of the length of the
+    #         data being analysed. Default is 0.25.
+    #     lags: None or int
+    #         Number of lags to compute autocorrelation for. Default is len(rolling_window)*0.25.
+    #     fit_method: str
+    #         Method selection: 'lmfit' or 'curve_fit'. Default is 'lmfit'.
+    #     roll_offset : int
+    #         Rolling window offset used when computing dominant eigenvalue extracted from
+    #         autocorrelation (DE-AC). The DE-AC computation is relatively expensive so this is
+    #         rarely taken as 1 (as is the case for the other EWS). The default is 20.
+    #     user_model: str
+    #         Model selection: 'discrete_exp_decay', 'discrete_exp_cosine_decay',
+    #         'continuous_exp_decay', 'continuous_exp_cosine_decay', or 'test_model'.
+    #         Default is 'test_model'.
+    #         1、discrete_exp_decay; 2、discrete_exp_cosine_decay; 3、continuous_exp_decay;
+    #         4、continuous_exp_cosine_decay; 5、test_model (try all four models and select best fit).
+    #         ......
+    #
+    #     Returns
+    #     -------
+    #     None.
+    #
+    #     '''
+    #
+    #     # Import libraries = 加载所需的包
+    #     from statsmodels.tsa.stattools import acf
+    #     from tqdm.auto import tqdm
+    #
+    #     # Get time series data prior to transition
+    #     if self.transition:
+    #         df_pre = self.state[self.state.index <= self.transition]
+    #     else:
+    #         df_pre = self.state
+    #
+    #     # Get absolute size of rollling window if given as a proportion
+    #     if 0 < rolling_window <= 1:
+    #         rw_absolute = int(rolling_window * len(df_pre))
+    #     else:
+    #         rw_absolute = rolling_window
+    #
+    #     # If residuals column exists, compute over residuals.
+    #     # Get data on which to compute dominant eigenvalue (\lambda).
+    #     if "residuals" in df_pre.columns:
+    #         ts_vals = df_pre["residuals"]
+    #     else:
+    #         ts_vals = df_pre["state"]
+    #
+    #     list_times = []  # List to store time values
+    #     list_dominant_eigenvalue = []  # List to store dominant eigenvalue values
+    #     list_rsquared = []  # List to store best R² value
+    #
+    #     # Set up rolling window and progress bar
+    #     for k in tqdm(np.arange(0, len(ts_vals) - (rw_absolute - 1), roll_offset), desc="Computing de"):
+    #         # Select subset of series contained in window
+    #         window_series = ts_vals.iloc[k: k + rw_absolute]
+    #         # Assign the time value for the metrics (right end point of window)
+    #         t_point = ts_vals.index[k + (rw_absolute - 1)]
+    #
+    #         # Maximum lag for autocorrelation
+    #         lags = int(len(window_series) * 0.25) if lags is None else lags
+    #         # Compute lag-\tau autocorrelation and confidence intervals
+    #         acf_values, confint = acf(window_series, nlags=lags, alpha=0.05, fft=True)  # nlags=最大滞后阶数
+    #         # print('k=', k, '   ', 'acf_values: ')
+    #         # print(acf_values)
+    #
+    #         # # Convert a numpy array to a pandas Series = 将 numpy 数组转换为 pandas Series
+    #         # acf_values_series = pd.Series(acf_values)
+    #         #
+    #         # # Calculate the 'dominant_eigenvalue' col average value of the sliding window
+    #         # window_size = 0.15
+    #         # # Get absolute size of rollling window if given as a proportion
+    #         # if 0 < window_size <= 1:
+    #         #     abs_window = int(window_size * len(acf_values))
+    #         # else:
+    #         #     abs_window = window_size
+    #         # # print('rollling window:', abs_window, ' ', 'len(df_lagsAC):', len(df_lagsAC.dropna()))
+    #         #
+    #         # # The minimum acceptable number of observations to calculate the statistic = 可以接受的最小观测值数量来计算统计量
+    #         # acf_values = acf_values_series.rolling(window=abs_window, min_periods=1).mean().values
+    #
+    #
+    #         # Determine effective max_tau using confidence intervals
+    #         confint_tau = lags
+    #         for tau in range(0, lags + 1):
+    #             upper_bound = confint[tau, 1] - acf_values[tau]
+    #             lower_bound = confint[tau, 0] - acf_values[tau]
+    #             if (acf_values[tau] > lower_bound and acf_values[tau] < upper_bound):
+    #                 confint_tau = tau
+    #                 break
+    #         #
+    #         start_lag = 0
+    #         best_lags = confint_tau
+    #         # print('best_lags=', best_lags)
+    #         if best_lags <= 4:
+    #             best_lags = 4
+    #         xdata = np.arange(start_lag, best_lags)
+    #         ydata = acf_values[start_lag: best_lags]
+    #
+    #         # -------------- Computing dominant eigenvalue ($\lambda$) --------------
+    #         # Discrete Exponential Decay Function  = 定义指数衰减函数: 离散系统-->Fold,TC,PF-->PD(Flip)
+    #         def discrete_exp_decay(x, R, A):
+    #             return R ** abs(x)
+    #             # return A * R ** abs(x)
+    #
+    #         # Discrete Exponential Cosine Decay Function = 定义指数衰减余弦波函数：离散系统-->NS
+    #         def discrete_exp_cosine_decay(x, R, A, phi):
+    #             return R ** abs(x) * np.cos(phi * x)
+    #             # return A * R ** abs(x) * np.cos(phi * x)
+    #
+    #         # Continuous Exponential Decay Function = 定义e指数衰减函数：连续系统-->Fold,TC,PF
+    #         def continuous_exp_decay(x, R, A):
+    #             return np.exp(R * abs(x))
+    #             # return A * np.exp(R * abs(x))
+    #
+    #         # Continuous Exponential Cosine Decay Function = 定义e指数衰减余弦波函数：连续系统-->Hopf
+    #         def continuous_exp_cosine_decay(x, R, A, omega):
+    #             # return np.exp(R * abs(x)) * np.cos(omega * x)
+    #             return A * np.exp(R * abs(x)) * np.cos(omega * x)
+    #
+    #         # Define the model mapping dictionary = 定义模型映射字典
+    #         model_map = {
+    #             'discrete_exp_decay': discrete_exp_decay,
+    #             'discrete_exp_cosine_decay': discrete_exp_cosine_decay,
+    #             'continuous_exp_decay': continuous_exp_decay,
+    #             'continuous_exp_cosine_decay': continuous_exp_cosine_decay
+    #         }
+    #         # Get the model function = 获取实际的模型函数
+    #         if isinstance(user_model, str) and user_model == 'test_model':
+    #             # If 'user_model' is a string. Try all models and choose the best fit.
+    #             best_r_squared = -np.inf
+    #             best_model_name = None
+    #             best_dominant_eigenvalue = np.nan
+    #             for model_name, model_func in model_map.items():
+    #                 try:
+    #                     if fit_method == 'lmfit':
+    #                         de, rsq = self.fit_data_with_lmfit(xdata, ydata, model_func)
+    #                     elif fit_method == 'curve_fit':
+    #                         de, rsq = self.fit_data_with_curve_fit(xdata, ydata, model_func)
+    #
+    #                     # Updating the best model = 更新最佳模型
+    #                     if rsq > best_r_squared:
+    #                         best_r_squared = rsq
+    #                         best_dominant_eigenvalue = de
+    #                         best_model_name = model_name
+    #
+    #                 except Exception as e:
+    #                     continue
+    #
+    #             # Use the best model results = 使用最佳模型结果
+    #             dominant_eigenvalue = best_dominant_eigenvalue
+    #             r_squared = best_r_squared
+    #             model_used = best_model_name if best_model_name else "None"
+    #             print('best_model_name: ', model_used, ';  ', 'dominant_eigenvalue: ', dominant_eigenvalue, ';  ', 'r_squared: ', r_squared)
+    #
+    #         elif isinstance(user_model, str) and user_model in model_map:
+    #             selected_model = model_map[user_model]
+    #             # Fit was performed using the selected model = 使用选择的模型进行拟合
+    #             if fit_method == 'lmfit':
+    #                 dominant_eigenvalue, r_squared = self.fit_data_with_lmfit(xdata=xdata, ydata=ydata, user_model=selected_model)
+    #             elif fit_method == 'curve_fit':
+    #                 dominant_eigenvalue, r_squared = self.fit_data_with_curve_fit(xdata=xdata, ydata=ydata, user_model=selected_model)
+    #         else:
+    #             raise ValueError(f"Unknown model name: {user_model}. The available models are: {list(model_map.keys())}")
+    #         # print('user_model_name: ', user_model, ';  ', 'dominant_eigenvalue: ', dominant_eigenvalue,  ';  ', 'r_squared: ', r_squared)
+    #
+    #         # 存储结果
+    #         list_times.append(t_point)
+    #         list_dominant_eigenvalue.append(dominant_eigenvalue)
+    #         list_rsquared.append(r_squared)
+    #
+    #     # Create the resulting DataFrame = 创建结果DataFrame
+    #     df_ews_de = pd.DataFrame({
+    #         'time': list_times,
+    #         'de': list_dominant_eigenvalue,
+    #         'r_squared': list_rsquared,
+    #     }).set_index(f'{self.ews.index.name}')
+    #     # print(df_ews_de)
+    #
+    #     # Calculate the 'dominant_eigenvalue' col average value of the sliding window
+    #     window_size = 0.15
+    #     # Get absolute size of rollling window if given as a proportion
+    #     if 0 < window_size <= 1:
+    #         abs_window = int(window_size * len(df_ews_de.dropna()))
+    #     else:
+    #         abs_window = window_size
+    #     # print('rollling window:', abs_window, ' ', 'len(df_ews_var_ac_de):', len(df_ews_de.dropna()))
+    #
+    #     # # The minimum acceptable number of observations to calculate the statistic = 可以接受的最小观测值数量来计算统计量
+    #     df_ews_de['de'] = df_ews_de['de'].dropna().rolling(window=abs_window, min_periods=1).mean()
+    #
+    #     # or Use of exponentially weighted moving averages = 使用指数加权移动平均
+    #     # df_ews_de['de'] = df_ews_de['de'].dropna().ewm(span=abs_window, adjust=False).mean()
+    #
+    #     self.ews['de'] = df_ews_de['de']
+    #     # self.ews['de_r_squared'] = df_ews_de['r_squared']
+
+
+    # Calculate 'dominant_eigenvalue (de)' method 2：
+    def lagsAC_transpose(df_ews: pd.DataFrame) -> pd.DataFrame:
+        """Transpose the DataFrame containing lagged autocorrelation values"""
+        # Select columns that start with 'ac' = 筛选出以 'ac' 开头的列
+        ac_columns = [col for col in df_ews.columns if col.startswith('ac')]
+        # print(ac_columns)
+
+        # Sort these column names by the number following 'ac' = 对这些列名进行排序
+        ac_columns_sorted = sorted(ac_columns, key=lambda x: int(x[2:]))
+        # print(ac_columns_sorted)
+
+        # Create a new DataFrame with only the sorted 'ac' columns = 创建新的 DataFrame 仅包含排序后的 'ac' 列
+        df_lagsAC = df_ews[ac_columns_sorted]
+        # print('df_lagsAC: ')
+        # print(df_lagsAC)
+
+        # Calculate the 'dominant_eigenvalue' col average value of the sliding window
+        window_size = 0.15
+        # Get absolute size of rollling window if given as a proportion
+        if 0 < window_size <= 1:
+            abs_window = int(window_size * len(df_lagsAC.dropna()))
+        else:
+            abs_window = window_size
+        # print('rollling window:', abs_window, ' ', 'len(df_lagsAC):', len(df_lagsAC.dropna()))
+
+        # # The minimum acceptable number of observations to calculate the statistic = 可以接受的最小观测值数量来计算统计量
+        # df_lagsAC[ac_columns_sorted] = df_lagsAC[ac_columns_sorted].dropna().rolling(window=abs_window, min_periods=1).mean()
+
+        # # or Use of exponentially weighted moving averages = 使用指数加权移动平均
+        # df_lagsAC[ac_columns_sorted] = df_lagsAC[ac_columns_sorted].dropna().ewm(span=abs_window, adjust=False).mean()
+        # # print('df_lagsAC_rolling: ')
+        # # print(df_lagsAC)
+
+        # Transpose the DataFrame = 转置 DataFrame
+        df_lagsAC_tran = df_lagsAC.transpose()  # ordf_t = df.T
+
+        # Modify row index to be the lag times = 修改行索引
+        df_lagsAC_tran.index = [int(idx[2:]) for idx in df_lagsAC_tran.index]
+        # Set the new row index name = 设置新的行索引名
+        df_lagsAC_tran.index.name = 'tau'
+
+        # Modify column names to reflect time points = 修改列名以反映时间点
+        df_lagsAC_tran.columns = [f'time_{float(col)}' for col in df_lagsAC_tran.columns]
+        # print(df_lagsAC_tran)
+
+        return df_lagsAC_tran
+
+
+    def compute_de(self, rolling_window=0.25, lags=5, user_model='discrete_exp_decay'):
+        '''
+        Compute dominant eigenvalue over a rolling window. Add to dataframe.
+
+        Parameters
+        ----------
+        rolling_window : float
+            Length of rolling window used to compute autocorrelation. Can be specified
+            as an absolute value or as a proportion of the length of the
+            data being analysed. Default is 0.25.
+        lags : int
+            Lag of autocorrelation
+        user_model : str
+            1、discrete_exp_decay;
+            2、discrete_exp_cosine_decay;
+            3、continuous_exp_decay;
+            4、continuous_exp_cosine_decay
+            ......
+
+        Returns
+        -------
+        None.
+
+        '''
+
+        from scipy.optimize import curve_fit
+
+        # create DataFrame
+        df_lags_ac = pd.DataFrame()
+
+        # Get time series data prior to transition
+        if self.transition:
+            df_pre = self.state[self.state.index <= self.transition]
+        else:
+            df_pre = self.state
+
+        # Get absolute size of rollling window if given as a proportion
+        if 0 < rolling_window <= 1:
+            rw_absolute = int(rolling_window * len(df_pre))
+        else:
+            rw_absolute = rolling_window
+
+        # Compute lag-\tau autocorrelation over a rolling window
+        for lag in np.arange(lags):
+            # If residuals column exists, compute over residuals.
+            if 'residuals' in df_pre.columns:
+                df_lags_ac['ac{}'.format(lag)] = df_pre['residuals'].rolling(window=rw_absolute).apply(lambda x: x.autocorr(lag=lag), raw=False)
+            # Else, compute over state variable
+            else:
+                df_lags_ac[f'ac{lag}'] = df_pre['state'].rolling(window=rw_absolute).apply(lambda x: x.autocorr(lag=lag), raw=False)
+
+        # Drop NaN values
+        df_lags_ac = df_lags_ac.dropna()
+
+        # transpose DataFrame
+        df_lags_ac_tran = TimeSeries.lagsAC_transpose(df_lags_ac)
+
+        # -------------- Computing dominant eigenvalue (R/$\lambda$) --------------
+        # copy data to be fitted
+        x = df_lags_ac_tran.index.values
+        # print(x)
+
+        # empty list
+        list_lags_AC_fit = []
+        list_lags_AC_fit_colname = []
+        list_dominant_eigenvalue = []
+
+        # Discrete Exponential Decay Function  = 定义指数衰减函数: 离散系统-->Fold,TC,PF-->PD(Flip)
+        def discrete_exp_decay(x, R, A):
+            return R ** abs(x)
+
+        # Discrete Exponential Cosine Decay Function = 定义指数衰减余弦波函数：离散系统-->NS
+        def discrete_exp_cosine_decay(x, R, A, phi):
+            return R ** abs(x) * np.cos(phi * x)
+
+        # Continuous Exponential Decay Function = 定义e指数衰减函数：连续系统-->Fold,TC,PF
+        def continuous_exp_decay(x, R, A):
+            return np.exp(R * abs(x))
+
+        # Continuous Exponential Cosine Decay Function = 定义e指数衰减余弦波函数：连续系统-->Hopf
+        def continuous_exp_cosine_decay(x, R, A, omega):
+            return np.exp(R * abs(x)) * np.cos(omega * x)
+
+        # Define the model mapping dictionary = 定义模型映射字典
+        model_map = {
+            'discrete_exp_decay': discrete_exp_decay,
+            'discrete_exp_cosine_decay': discrete_exp_cosine_decay,
+            'continuous_exp_decay': continuous_exp_decay,
+            'continuous_exp_cosine_decay': continuous_exp_cosine_decay
+        }
+
+        if isinstance(user_model, str) and user_model in model_map:
+            selected_model = model_map[user_model]
+            for col in df_lags_ac_tran.columns[::1]:
+                y = df_lags_ac_tran[col].values
+                # print(y)
+                # print('col: ', float(col[5:]))
+
+                # Fitting data using the ‘curve_fit’ = 使用’curve_fit‘拟合数据
+                try:
+                    # popt, pcov = curve_fit(damped_sine, x, y)
+                    popt, pcov = curve_fit(selected_model, x, y, maxfev=1000000)
+                    # 计算参数的标准偏差
+                    if pcov is not None:
+                        perr = np.sqrt(np.diag(pcov))
+                    else:
+                        perr = np.array([np.inf] * len(popt))  # 如果 pcov 是无效的，则标准偏差为无限
+                except ValueError as e:
+                    print(e)
+
+                # Extract specific values from parameter data = 从参数数据中提取特定值
+                dominant_eigenvalue = popt[0]
+
+                # Append the result to the list
+                list_dominant_eigenvalue.append({
+                    f'{self.ews.index.name}': float(col[5:]),
+                    'de': dominant_eigenvalue,
+                })
+
+        # Save ews of dominant eigenvalue to dataframe
+        df_ews_de = pd.DataFrame(list_dominant_eigenvalue).set_index(f'{self.ews.index.name}')
+
+        # Calculate the 'dominant_eigenvalue' col average value of the sliding window
+        window_size = 0.15
+        # Get absolute size of rollling window if given as a proportion
+        if 0 < window_size <= 1:
+            abs_window = int(window_size * len(df_ews_de.dropna()))
+        else:
+            abs_window = window_size
+        # print('rollling window:', abs_window, ' ', 'len(df_ews_var_ac_de):', len(df_ews_de.dropna()))
+
+        # The minimum acceptable number of observations to calculate the statistic = 可以接受的最小观测值数量来计算统计量
+        # df_ews_de['de'] = df_ews_de['de'].dropna().rolling(window=abs_window, min_periods=1).mean()
+
+        # # or Use of exponentially weighted moving averages = 使用指数加权移动平均
+        # df_ews_de['de'] = df_ews_de['de'].dropna().ewm(span=abs_window, adjust=False).mean()
+
+        self.ews['de'] = df_ews_de['de']
+
+
+    def compute_dev(self, rolling_window=0.25, roll_offset=20):
+        """
+        Compute the dynamical eigenvalue (|DEV|) over a rolling window.
+        If residuals have not been computed, computation will be performed over state variable.
+        Output is stored in the self.ews dataframe.
+        note: Python calls the rpy2 package for R
+        1. Python version: 3.8.20
+        2. R version 4.5.1
+        3. rpy2 version 3.6.1
+        4. R: 'EWSmethods' package version 1.3.1
+        Parameters
+        ----------
+        rolling_window : float
+            Length of rolling window used to compute dominant eigenvalue (|DEV|).
+            Can be specified as an absolute value or as a proportion of the length of the
+            data being analysed. Default is 0.25.
+        roll_offset : int
+            Rolling window offset used when computing dynamical eigenvalue (|DEV|).
+            The dynamical eigenvalue computation is relatively expensive so this is
+            rarely taken as 1 (as is the case for the other EWS). The default is 20.
+        progress_bar: True
+        Returns
+        -------
+        None.
+
+        """
+
+        # Python calls the rpy2 package for R
+        import rpy2.robjects as ro
+        from rpy2.robjects.packages import importr
+        from rpy2.robjects import pandas2ri
+        from rpy2.robjects.conversion import localconverter
+        # Import libraries R = 加载所需的R包
+        EWSmethods = importr('EWSmethods')
+
+        from tqdm.auto import tqdm
+
+        # Get time series data prior to transition
+        if self.transition:
+            df_pre = self.state[self.state.index <= self.transition]
+        else:
+            df_pre = self.state
+
+        # Get absolute size of rollling window if given as a proportion
+        if 0 < rolling_window <= 1:
+            rw_absolute = int(rolling_window * len(df_pre))
+        else:
+            rw_absolute = rolling_window
+
+        # If residuals column exists, compute over residuals.
+        # Get data on which to compute dominant eigenvalue (|DEV|).
+        if "residuals" in df_pre.columns:
+            ts_vals = df_pre["residuals"]
+        else:
+            ts_vals = df_pre["state"]
+
+        list_times = []
+        list_dev_eigenJ = []
+        list_dev_reJ = []
+        list_dev_imJ = []
+        # Set up rolling window and progress bar
+        for k in tqdm(np.arange(0, len(ts_vals) - (rw_absolute - 1), roll_offset), desc="Computing |DEV|"):
+            # Select subset of series contained in window
+            window_series = ts_vals.iloc[k: k + rw_absolute]
+            # Assign the time value for the metrics (right end point of window)
+            t_point = ts_vals.index[k + (rw_absolute - 1)]
+            # From Pd.Series to Pd.DataFrame
+            df_state = pd.DataFrame({'time': window_series.index, 'state': window_series.values})
+            # From pandas to R
+            with (ro.default_converter + pandas2ri.converter).context():
+                r_df_state = ro.conversion.get_conversion().py2rpy(df_state)
+            # Compute Jacobian matrices (absolute maximum eigenvalue, real component of dominant eigenvalue, and imaginary component of dominant eigenvalue)
+            est_jac = EWSmethods.uni_smap_jacobian(data=r_df_state)
+            # Extract Jacobian matrices = 提取Jacobian矩阵
+            dev_smapJ = np.array(est_jac.rx2('smapJ'))
+            # Extract absolute maximum eigenvalue = 提取绝对最大特征值
+            dev_eigenJ = np.array(est_jac.rx2('eigenJ'))[0]
+            # Extract real component of dominant eigenvalue = 提取特征值实部
+            dev_reJ = np.array(est_jac.rx2('reJ'))[0]
+            # Extract imaginary component of dominant eigenvalue = 提取特征值虚部
+            dev_imJ = np.array(est_jac.rx2('imJ'))[0]
+
+            list_times.append(t_point)
+            list_dev_eigenJ.append(dev_eigenJ)
+            list_dev_reJ.append(dev_reJ)
+            list_dev_imJ.append(dev_imJ)
+
+        # Create "df_dev" DataFrame
+        df_dev = pd.DataFrame({
+            'time': list_times,
+            'dev': list_dev_eigenJ,
+            'dev_re': list_dev_reJ,
+            'dev_im': list_dev_imJ
+        }).set_index('time')
+
+        # Join 'self.ews' dataframe
+        self.ews = self.ews.join(df_dev)
+
+
+class MultiTimeSeries:
+    """
+    Multivariate time series data on which to compute early warning signals.
+
+    Parameters
+    ----------
+    data : pandas.DataFrame
+        Contains each time series as a column. Index represents time values and
+        is carried over.
+    transition : float
+        Time value at which transition occurs, if any. If defined, early warning signals
+        are only computed up to this point in the time series
+    """
+
+    def __init__(self, data, transition=None):
+        # If data is not provided as a dataframe, flag error
+        if type(data) != pd.DataFrame:
+            print("\nERROR: data has been provided as type {}".format(type(data)))
+            print("Please provide data as a pandas DataFrame.\n")
+            return
+
+        # Set state and transition attributes
+        self.state = data
+        self.transition = float(transition) if transition else transition
+        self.var_names = data.columns
+
+        # Initialise other attributes
+        self.ews = pd.DataFrame(index=data.index)
+        self.ktau = dict()
+
+    def detrend(self, method="Gaussian", bandwidth=0.2, span=0.2):
+        """
+        Detrend the time series using a chosen method.
+        Add column to the dataframe for 'smoothing' and 'residuals' for each variable
+
+        Parameters
+        ----------
+        method : str, optional
+            Method of detrending to use.
+            Select from ['Gaussian', 'Lowess']
+            The default is 'Gaussian'.
+        bandwidth : float, optional
+            Bandwidth of Gaussian kernel. Provide as a proportion of data length
+            or as a number of data points. As in the R function ksmooth
+            (used by the earlywarnings package in R), we define the bandwidth
+            such that the kernel has its quartiles at +/- 0.25*bandwidth.
+            The default is 0.2.
+        span : float, optional
+            Span of time-series data used for Lowess filtering. Provide as a
+            proportion of data length or as a number of data points.
+            The default is 0.2.
+
+        Returns
+        -------
+        None.
+
+        """
+
+        # Error messages
+        if method not in ["Lowess", "Gaussian"]:
+            print("ERROR: {} is not a valid detrending method.\n".format(method))
+
+        # Get time series data prior to transition
+        if self.transition:
+            df_pre = self.state[self.state.index <= self.transition]
+        else:
+            df_pre = self.state
+
+        if method == "Gaussian":
+            # Get size of bandwidth in terms of num. datapoints if given as a proportion
+            if 0 < bandwidth <= 1:
+                bw_num = bandwidth * len(df_pre)
+            else:
+                bw_num = bandwidth
+
+            # Use the gaussian_filter function provided by Scipy
+            # Standard deviation of kernel given bandwidth
+            # Note that for a Gaussian, quartiles are at +/- 0.675*sigma
+            sigma = (0.25 / 0.675) * bw_num
+
+            # Do guassian smoothing on each variable
+            for var_name in self.var_names:
+                smooth_values = gf(df_pre[var_name].values, sigma=sigma, mode="reflect")
+                smooth_series = pd.Series(smooth_values, index=df_pre.index)
+                # Add smoothed data and residuals to the 'state' DataFrame
+                self.state["{}_smoothing".format(var_name)] = smooth_series
+                self.state["{}_residuals".format(var_name)] = (
+                        self.state[var_name] - self.state["{}_smoothing".format(var_name)]
+                )
+
+        if method == "Lowess":
+            # Convert span to a proportion of the length of the data
+            if not 0 < span <= 1:
+                span_prop = span / len(df_pre)
+            else:
+                span_prop = span
+
+            # Do Lowess smoothing on each variable
+            for var_name in self.var_names:
+                smooth_values = lowess(
+                    df_pre[var_name].values, df_pre.index.values, frac=span_prop
+                )[:, 1]
+                smooth_series = pd.Series(smooth_values, index=df_pre.index)
+                # Add smoothed data and residuals to the 'state' DataFrame
+                self.state["{}_smoothing".format(var_name)] = smooth_series
+                self.state["{}_residuals".format(var_name)] = (
+                        self.state[var_name] - self.state["{}_smoothing".format(var_name)]
+                )
+
+    def compute_covar(self, rolling_window=0.25, leading_eval=False):
+        """
+        Compute the covariance matrix over a rolling window.
+        If residuals have not been computed, computation will be
+        performed over state variable.
+
+        Put covariance matrices into self.covar
+        Put leading eigenvalue into self.ews
+
+        Parameters
+        ----------
+        rolling_window : float
+            Length of rolling window used to compute variance. Can be specified
+            as an absolute value or as a proportion of the length of the
+            data being analysed. Default is 0.25.
+        leading_eval : bool
+            Whether to compute the leading eigenvalue of the covariance matrix.
+            This has been suggested as an early warning signal (Carpenter et al. 2008, Ecol. Letters)
+
+        Returns
+        -------
+        None.
+
+        """
+
+        # Get time series data prior to transition
+        if self.transition:
+            df_pre = self.state[self.state.index <= self.transition]
+        else:
+            df_pre = self.state
+
+        # Get absolute size of rollling window if given as a proportion
+        if 0 < rolling_window <= 1:
+            rw_absolute = int(rolling_window * len(df_pre))
+        else:
+            rw_absolute = rolling_window
+
+        # If residuals column exists, compute over residuals.
+        if "{}_residuals".format(self.var_names[0]) in df_pre.columns:
+            col_names_to_compute = [
+                "{}_residuals".format(var) for var in self.var_names
+            ]
+        else:
+            col_names_to_compute = self.var_names
+
+        # Compute covariance matrix
+        df_covar = df_pre[col_names_to_compute].rolling(window=rw_absolute).cov()
+        self.covar = df_covar
+
+        # Compute leading eigenvalue
+        if leading_eval:
+            covar_matrices = df_covar.values.reshape(
+                -1, len(self.var_names), len(self.var_names)
+            )
+            ar_evals = np.zeros(len(df_pre))
+            for idx, mat in enumerate(covar_matrices):
+                # Only compute eval if there are no NaN entries
+                if not np.any(np.isnan(mat)):
+                    evals, evecs = np.linalg.eig(mat)
+                    ar_evals[idx] = max(evals)
+                else:
+                    ar_evals[idx] = np.nan
+            series_evals = pd.Series(ar_evals, index=df_pre.index)
+            self.ews["covar_leading_eval"] = series_evals
+
+    def compute_corr(self, rolling_window=0.25):
+        """
+        Compute the (Pearson) correlation matrix over a rolling window.
+        If residuals have not been computed, computation will be
+        performed over state variable.
+
+        Put correlation matrices into self.corr
+
+        Parameters
+        ----------
+        rolling_window : float
+            Length of rolling window used to compute variance. Can be specified
+            as an absolute value or as a proportion of the length of the
+            data being analysed. Default is 0.25.
+
+        Returns
+        -------
+        None.
+
+        """
+
+        # Get time series data prior to transition
+        if self.transition:
+            df_pre = self.state[self.state.index <= self.transition]
+        else:
+            df_pre = self.state
+
+        # Get absolute size of rollling window if given as a proportion
+        if 0 < rolling_window <= 1:
+            rw_absolute = int(rolling_window * len(df_pre))
+        else:
+            rw_absolute = rolling_window
+
+        # If residuals column exists, compute over residuals.
+        if "{}_residuals".format(self.var_names[0]) in df_pre.columns:
+            col_names_to_compute = [
+                "{}_residuals".format(var) for var in self.var_names
+            ]
+        else:
+            col_names_to_compute = self.var_names
+
+        # Compute correlation matrix
+        df_corr = df_pre[col_names_to_compute].rolling(window=rw_absolute).corr()
+        self.corr = df_corr
+
+
+# -----------------------------
+# Eigenvalue reconstruction
+# ------------------------------
+
+
+def eval_recon_rolling(
+        df_in,
+        roll_window=0.4,
+        roll_offset=1,
+        smooth="Lowess",
+        span=0.1,
+        band_width=0.2,
+        upto="Full",
+):
+    """
+    Compute reconstructed eigenvalues from residuals of multi-variate
+    non-stationary time series
+
+    Args
+    ----
+    df_in: pd.DataFrame
+        Time series data with variables in different columns, indexed by time
+    roll_window: float
+        Rolling window size as a proportion of the length of the time series
+        data.
+    roll_offset: int
+        Offset of rolling window upon each EWS computation - make larger to save
+        on computational time
+    smooth: {'Gaussian', 'Lowess', 'None'}
+        Type of detrending.
+    band_width: float
+        Bandwidth of Gaussian kernel. Taken as a proportion of time-series length if in (0,1),
+        otherwise taken as absolute.
+    span: float
+        Span of time-series data used for Lowess filtering. Taken as a
+        proportion of time-series length if in (0,1), otherwise taken as
+        absolute.
+    upto: int or 'Full'
+        Time up to which EWS are computed. Enter 'Full' to use
+        the entire time-series. Otherwise enter a time value.
+
+    Returns
+    --------
+
+        pd.DataFrame:
+                DataFrame indexed by time, with columns of the Jacobian,
+                eigenvalues and eigenvectors at each point in time.
+
+    """
+
+    # Properties of df_in
+    var_names = df_in.columns
+
+    # Select portion of data where EWS are evaluated (e.g only up to bifurcation)
+    if upto == "Full":
+        df_pre = df_in.copy()
+    else:
+        df_pre = df_in.loc[:upto]
+
+    # ------Data detrending--------
+
+    # Compute the absolute size of the bandwidth if it is given as a proportion
+    if 0 < band_width <= 1:
+        bw_size = df_pre.shape[0] * band_width
+    else:
+        bw_size = band_width
+
+    # Compute the Lowess span as a proportion if given as absolute
+    if not 0 < span <= 1:
+        span = span / df_pre.shape[0]
+    else:
+        span = span
+
+    # Compute smoothed data and residuals
+    if smooth == "Gaussian":
+        # Loop through variables
+        for var in var_names:
+            smooth_data = gf(df_pre[var].values, sigma=bw_size, mode="reflect")
+            smooth_series = pd.Series(smooth_data, index=df_pre.index)
+            residuals = df_pre[var].values - smooth_data
+            resid_series = pd.Series(residuals, index=df_pre.index)
+            # Add smoothed data and residuals to df_pre
+            df_pre[var + "_s"] = smooth_series
+            df_pre[var + "_r"] = resid_series
+
+    if smooth == "Lowess":
+        # Loop through variabless
+        for var in var_names:
+            smooth_data = lowess(df_pre[var].values, df_pre.index.values, frac=span)[
+                          :, 1
+                          ]
+            smooth_series = pd.Series(smooth_data, index=df_pre.index)
+            residuals = df_pre[var].values - smooth_data
+            resid_series = pd.Series(residuals, index=df_pre.index)
+            # Add smoothed data and residuals to df_pre
+            df_pre[var + "_s"] = smooth_series
+            df_pre[var + "_r"] = resid_series
+
+    # Compute the rolling window size (integer value)
+    rw_size = int(np.floor(roll_window * df_in.shape[0]))
+
+    # Set up a rolling window
+
+    # Number of components in the residual time-series
+    num_comps = len(df_pre)
+    # Rolling window offset (can make larger to save on computation time)
+    roll_offset = int(roll_offset)
+
+    # Initialise a list of dictionaries containing eval data
+    list_evaldata = []
+
+    # Loop through window locations shifted by roll_offset
+    for k in np.arange(0, num_comps - (rw_size - 1), roll_offset):
+        # Select subset of residuals contained in window
+        df_window = df_pre[[var + "_r" for var in var_names]].iloc[k: k + rw_size]
+        # Asisgn the time value for the metrics (right end point of window)
+        t_point = df_pre.index[k + (rw_size - 1)]
+
+        # Do eigenvalue reconstruction on residuals
+        dic_eval_recon = helpers.eval_recon(df_window)
+        # Add time component
+        dic_eval_recon["time"] = t_point
+        # Add them to list
+        list_evaldata.append(dic_eval_recon)
+
+    # Create dataframe from list of dicts of eval data
+    df_evaldata = pd.DataFrame(list_evaldata)
+    df_evaldata.set_index("time", inplace=True)
+
+    # Create output dataframe that merges all useful info
+    df_out = pd.concat(
+        [
+            df_in,
+            df_pre[
+                [var + "_r" for var in var_names] + [var + "_s" for var in var_names]
+                ],
+            df_evaldata,
+        ],
+        axis=1,
+    )
+
+    return df_out
+
+
+# ----------------------------------------------
+# Bootstrapping
+# –--------------------------------------------
+
+
+def block_bootstrap(series, n_samples, bs_type="Stationary", block_size=10):
+    """
+    Computes block-bootstrap samples of series.
+
+    Args
+    ----
+    series: pd.Series
+        Time-series data in the form of a Pandas Series indexed by time
+    n_samples: int
+        Number of bootstrapped samples to output.
+    bs_type: {'Stationary', 'Circular'}
+        Type of block-bootstrapping to perform.
+    block_size: int
+        Size of resampling blocks. Should be big enough to
+        capture important frequencies in the series.
+
+    Returns
+    -------
+    pd.DataFrame:
+        DataFrame containing the block-bootstrapped samples of series.
+        Indexed by sample number, then time.
+
+    """
+
+    # Set up list for sampled time-series
+    list_samples = []
+
+    # Stationary bootstrapping
+    if bs_type == "Stationary":
+        bs = StationaryBootstrap(block_size, series)
+
+        # Count for sample number
+        count = 1
+        for data in bs.bootstrap(n_samples):
+            df_temp = pd.DataFrame(
+                {"sample": count, "time": series.index.values, "x": data[0][0]}
+            )
+            list_samples.append(df_temp)
+            count += 1
+
+    if bs_type == "Circular":
+        bs = CircularBlockBootstrap(block_size, series)
+
+        # Count for sample number
+        count = 1
+        for data in bs.bootstrap(n_samples):
+            df_temp = pd.DataFrame(
+                {"sample": count, "time": series.index.values, "x": data[0][0]}
+            )
+            list_samples.append(df_temp)
+            count += 1
+
+    # Concatenate list of samples
+    df_samples = pd.concat(list_samples)
+    df_samples.set_index(["sample", "time"], inplace=True)
+
+    # Output DataFrame of samples
+    return df_samples
+
+
+def roll_bootstrap(
+        raw_series,
+        span=0.1,
+        roll_window=0.25,
+        roll_offset=1,
+        upto="Full",
+        n_samples=20,
+        bs_type="Stationary",
+        block_size=10,
+):
+    """
+    Smooths raw_series and computes residuals over a rolling window.
+    Bootstraps each segment and outputs samples.
+
+    Args
+    ----
+    raw_series: pd.Series
+        Time-series data in the form of a Pandas Seires indexed by time.
+    span: float
+        Proportion of data used for Loess filtering.
+    roll_windopw: float
+        Size of the rolling window (as a proportion
+        of the length of the data).
+    roll_offset: int
+        Number of data points to shift the rolling window
+        upon each iteration (reduce to increase computation time).
+    upto: int/'Full'
+        If 'Full', use entire time-series, otherwise input time up
+        to which EWS are to be evaluated.
+    n_samples: int
+        Number of bootstrapped samples to output.
+    bs_type: {'Stationary', 'Circular'}
+        Type of block-bootstrapping to perform.
+    block_size: int
+        Size of resampling blocks. Should be big enough to
+        capture important frequencies in the series.
+
+
+    Return
+    ------
+    pd.DataFrame:
+        DataFrame containing the block-bootstrapped samples at each time
+        in raw_series. Indexed by time in raw_series, then, sample number,
+        then time within the rolling window.
+
+    """
+
+    ## Parameter configuration
+
+    # Compute the rolling window size (integer value)
+    rw_size = int(np.floor(roll_window * raw_series.shape[0]))
+
+    # Compute the Lowess span as a proportion if given as absolute
+    if not 0 < span <= 1:
+        span = span / raw_series.shape[0]
+    else:
+        span = span
+
+    ## Data detrending
+
+    # Select portion of data up to 'upto'
+    if upto == "Full":
+        series = raw_series
+    else:
+        series = raw_series.loc[:upto]
+
+    # Smooth the series and compute the residuals
+    smooth_data = lowess(series.values, series.index.values, frac=span)[:, 1]
+    residuals = series.values - smooth_data
+    resid_series = pd.Series(residuals, index=series.index)
+
+    ## Rolling window over residuals
+
+    # Number of components in the residual time-series
+    num_comps = len(resid_series)
+    # Make sure window offset is an integer
+    roll_offset = int(roll_offset)
+
+    # Initialise a list for the sample residuals at each time point
+    list_samples = []
+
+    # Counter
+    i = 0
+
+    # Loop through window locations shifted by roll_offset
+    for k in np.arange(0, num_comps - (rw_size - 1), roll_offset):
+        # Select subset of series contained in window
+        window_series = resid_series.iloc[k: k + rw_size]
+        # Asisgn the time value for the metrics (right end point of window)
+        t_point = resid_series.index[k + (rw_size - 1)]
+
+        # Compute bootstrap samples of residauls within rolling window
+        df_samples_temp = block_bootstrap(window_series, n_samples, bs_type, block_size)
+        df_samples_temp.reset_index(inplace=True)
+        df_samples_temp["wintime"] = df_samples_temp["time"]
+
+        # Add column with real time (end of window)
+        df_samples_temp["time"] = t_point
+
+        # Reorganise index
+
+        df_samples_temp.reset_index(inplace=True)
+        df_samples_temp.set_index(["time", "sample", "wintime"], inplace=True)
+
+        # Append the list of samples
+        list_samples.append(df_samples_temp)
+
+        #        # Print update
+        #        if i % 1 ==0:
+        #            print('Bootstrap samples for window at t = %.2f complete' % (t_point))
+
+        i += 1
+
+    ## Organise output DataFrame
+
+    # Concatenate list of samples
+    df_samples = pd.concat(list_samples)
+
+    # Output DataFrame
+    return df_samples
+
+
+def mean_ci(data, alpha=0.95):
+    """
+    Compute confidence intervals (to alpha%) of the mean of data.
+    This is performed using bootstrapping.
+
+    Args
+    ----
+    data: pd.Series
+        Data provided as a Pandas Series
+    alpha: float
+        Confidence percentage.
+
+    Returns
+    -------
+    dict:
+        Dicitonary of mean, lower and upper bound of data
+    """
+
+    # Compute the mean of the Series
+    mean = data.mean()
+    # Obtain the values of the Series as an array
+    array = data.values
+    # Bootstrap the array (sample with replacement)
+    bs = IIDBootstrap(array)
+    # Compute confidence intervals of bootstrapped distribution
+    ci = bs.conf_int(np.mean, 1000, method="percentile", size=alpha)
+    # Lower and upper bounds
+    lower = ci[0, 0]
+    upper = ci[1, 0]
+
+    # Output dictionary
+    dict_out = {"Mean": mean, "Lower": lower, "Upper": upper}
+    return dict_out

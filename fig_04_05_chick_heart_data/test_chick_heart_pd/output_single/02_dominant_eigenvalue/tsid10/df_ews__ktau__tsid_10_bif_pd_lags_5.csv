@@ -1,0 +1,14 @@
+ews,ktau
+variance,0.9999999999999999
+ac1,-0.9999999999999999
+dev,-0.2
+dev_re,0.2
+dev_im,
+ac0,0.08606629658238703
+ac2,0.8666666666666666
+ac3,-0.6
+ac4,0.4666666666666666
+dominant_eigenvalue,-0.6
+variance_rolling_avg,0.9999999999999999
+ac1_rolling_avg,-0.9999999999999999
+dominant_eigenvalue_rolling_avg,-0.9999999999999999
