@@ -2,7 +2,7 @@
 
 This repository contains code to accompany the publication
 
-Zhiqin Ma, Chunhua Zeng, Ting Gao, Jinqiao Duan. Predicting the onset of period-doubling bifurcations via dominant eigenvalue extracted from autocorrelation. *Chaos, Solitons and Fractals*, xxx.
+Zhiqin Ma, Chunhua Zeng, Ting Gao, Jinqiao Duan. Predicting the onset of period-doubling bifurcations via dominant eigenvalue extracted from autocorrelation. *Chaos, Solitons and Fractals*, 2026, 207: 118010.
 
 
 ## Requirements
